@@ -2,6 +2,8 @@ module github.com/emersion/hydroxide
 
 go 1.24.0
 
+toolchain go1.24.4
+
 require (
 	github.com/ProtonMail/go-crypto v1.3.0
 	github.com/emersion/go-bcrypt v0.0.0-20170822072041-6e724a1baa63

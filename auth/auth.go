@@ -23,10 +23,95 @@ func authFilePath() (string, error) {
 
 type CachedAuth struct {
 	protonmail.Auth
-	LoginPassword   string
-	MailboxPassword string
-	KeySalts        map[string][]byte
+	LoginPassword         string
+	MailboxPassword       string
+	KeySalts              map[string][]byte
+	DisablePasswordReauth bool
 	// TODO: add padding
+}
+
+func DecodeBridgePassword(password string) (*[32]byte, error) {
+	var secretKey [32]byte
+	passwordBytes, err := base64.StdEncoding.DecodeString(password)
+	if err != nil || len(passwordBytes) != len(secretKey) {
+		return nil, ErrUnauthorized
+	}
+	copy(secretKey[:], passwordBytes)
+	return &secretKey, nil
+}
+
+func LoadCachedAuth(username, bridgePassword string) (*CachedAuth, *[32]byte, error) {
+	secretKey, err := DecodeBridgePassword(bridgePassword)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	auths, err := readCachedAuths()
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+
+	encrypted, ok := auths[username]
+	if !ok {
+		return nil, nil, ErrUnauthorized
+	}
+
+	decrypted, err := decrypt(encrypted, secretKey)
+	if err != nil {
+		return nil, nil, ErrUnauthorized
+	}
+
+	var cachedAuth CachedAuth
+	if err := json.Unmarshal(decrypted, &cachedAuth); err != nil {
+		return nil, nil, err
+	}
+
+	return &cachedAuth, secretKey, nil
+}
+
+func ExportCachedAuth(username, bridgePassword string, includePasswords bool) (*CachedAuth, error) {
+	cachedAuth, _, err := LoadCachedAuth(username, bridgePassword)
+	if err != nil {
+		return nil, err
+	}
+
+	exported := *cachedAuth
+	if !includePasswords {
+		exported.LoginPassword = ""
+		exported.DisablePasswordReauth = true
+	}
+
+	return &exported, nil
+}
+
+func ImportCachedAuth(username string, cachedAuth *CachedAuth, secretKey *[32]byte) error {
+	if cachedAuth == nil {
+		return errors.New("cached auth is required")
+	}
+
+	if cachedAuth.RefreshToken == "" || cachedAuth.UID == "" {
+		return errors.New("cached auth must contain at least UID and refresh token")
+	}
+
+	return EncryptAndSave(cachedAuth, username, secretKey)
+}
+
+func Verify(newClient func() *protonmail.Client, username, bridgePassword string) (*CachedAuth, error) {
+	cachedAuth, secretKey, err := LoadCachedAuth(username, bridgePassword)
+	if err != nil {
+		return nil, err
+	}
+
+	c := newClient()
+	if _, err := authenticate(c, cachedAuth, username); err != nil {
+		return nil, err
+	}
+
+	if err := EncryptAndSave(cachedAuth, username, secretKey); err != nil {
+		return nil, err
+	}
+
+	return cachedAuth, nil
 }
 
 func readCachedAuths() (map[string]string, error) {
@@ -123,6 +208,12 @@ func EncryptAndSave(auth *CachedAuth, username string, secretKey *[32]byte) erro
 func authenticate(c *protonmail.Client, cachedAuth *CachedAuth, username string) (openpgp.EntityList, error) {
 	auth, err := c.AuthRefresh(&cachedAuth.Auth)
 	if apiErr, ok := err.(*protonmail.APIError); ok && apiErr.Code == 10013 {
+		if cachedAuth.DisablePasswordReauth {
+			return nil, fmt.Errorf("cannot re-authenticate automatically: refresh token is invalid and password re-auth is disabled")
+		}
+		if cachedAuth.LoginPassword == "" {
+			return nil, fmt.Errorf("cannot re-authenticate automatically: refresh token is invalid and no login password is cached")
+		}
 		// Invalid refresh token, re-authenticate
 		authInfo, err := c.AuthInfo(username)
 		if err != nil {
@@ -181,12 +272,10 @@ type Manager struct {
 }
 
 func (m *Manager) Auth(username, password string) (*protonmail.Client, openpgp.EntityList, error) {
-	var secretKey [32]byte
-	passwordBytes, err := base64.StdEncoding.DecodeString(password)
-	if err != nil || len(passwordBytes) != len(secretKey) {
+	secretKey, err := DecodeBridgePassword(password)
+	if err != nil {
 		return nil, nil, ErrUnauthorized
 	}
-	copy(secretKey[:], passwordBytes)
 
 	s, ok := m.sessions[username]
 	if ok {
@@ -195,41 +284,26 @@ func (m *Manager) Auth(username, password string) (*protonmail.Client, openpgp.E
 			return nil, nil, ErrUnauthorized
 		}
 	} else {
-		auths, err := readCachedAuths()
-		if err != nil && !os.IsNotExist(err) {
-			return nil, nil, err
-		}
-
-		encrypted, ok := auths[username]
-		if !ok {
-			return nil, nil, ErrUnauthorized
-		}
-
-		decrypted, err := decrypt(encrypted, &secretKey)
+		cachedAuth, _, err := LoadCachedAuth(username, password)
 		if err != nil {
-			return nil, nil, ErrUnauthorized
-		}
-
-		var cachedAuth CachedAuth
-		if err := json.Unmarshal(decrypted, &cachedAuth); err != nil {
 			return nil, nil, err
 		}
 
 		c := m.newClient()
 		c.ReAuth = func() error {
-			if _, err := authenticate(c, &cachedAuth, username); err != nil {
+			if _, err := authenticate(c, cachedAuth, username); err != nil {
 				return err
 			}
-			return EncryptAndSave(&cachedAuth, username, &secretKey)
+			return EncryptAndSave(cachedAuth, username, secretKey)
 		}
 
 		// authenticate updates cachedAuth with the new refresh token
-		privateKeys, err := authenticate(c, &cachedAuth, username)
+		privateKeys, err := authenticate(c, cachedAuth, username)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if err := EncryptAndSave(&cachedAuth, username, &secretKey); err != nil {
+		if err := EncryptAndSave(cachedAuth, username, secretKey); err != nil {
 			return nil, nil, err
 		}
 

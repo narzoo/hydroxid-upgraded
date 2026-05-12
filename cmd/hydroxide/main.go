@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -73,6 +75,95 @@ func askBridgePass() (string, error) {
 	}
 	b, err := askPass("Bridge password")
 	return string(b), err
+}
+
+func ask(prompt string) (string, error) {
+	f := os.Stdin
+	if !term.IsTerminal(int(f.Fd())) {
+		var err error
+		if f, err = os.Open("/dev/tty"); err != nil {
+			return "", err
+		}
+		defer f.Close()
+	}
+
+	fmt.Fprintf(os.Stderr, "%v: ", prompt)
+	reader := bufio.NewReader(f)
+	line, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
+func completeHumanVerification(c *protonmail.Client, username, loginPassword string, apiErr *protonmail.APIError) (*protonmail.Auth, error) {
+	hvDetails, err := apiErr.GetHVDetails()
+	if err != nil {
+		return nil, fmt.Errorf("human verification requested but details could not be parsed: %v", err)
+	}
+
+	verifyURL := hvDetails.VerifyURL()
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Human verification required.")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Steps:")
+	fmt.Fprintln(os.Stderr, "  1. Open your browser's Developer Tools (F12)")
+	fmt.Fprintln(os.Stderr, "  2. Go to the Console tab and paste this snippet:")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, `     window.addEventListener("message", e => { if (e.data?.type === "pm_captcha" && e.data.token) prompt("Copy this token:", e.data.token) })`)
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  3. Open this URL and solve the verification challenge:")
+	fmt.Fprintf(os.Stderr, "     %s\n", verifyURL)
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  4. When the browser prompt shows the token, paste it below")
+	fmt.Fprintln(os.Stderr, "")
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		solvedToken, err := ask(fmt.Sprintf("Solved token (attempt %d/3)", attempt))
+		if err != nil {
+			return nil, err
+		}
+		if solvedToken == "" {
+			return nil, fmt.Errorf("human verification cancelled: empty solved token")
+		}
+
+		retryInfo, err := c.AuthInfo(username)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get auth info for verification retry: %v", err)
+		}
+
+		authData, err := c.AuthWithHV(username, loginPassword, retryInfo, hvDetails.SolvedCopy(solvedToken))
+		if err == nil {
+			return authData, nil
+		}
+
+		retryAPIError, ok := err.(*protonmail.APIError)
+		if !ok {
+			return nil, err
+		}
+
+		if retryAPIError.Code == protonmail.HumanValidationInvalidToken {
+			fmt.Fprintln(os.Stderr, "Solved token was not accepted. Please retry with a fresh token from the browser prompt.")
+			continue
+		}
+
+		if retryAPIError.IsHVError() {
+			if refreshedDetails, detailsErr := retryAPIError.GetHVDetails(); detailsErr == nil && refreshedDetails.Token != "" {
+				hvDetails = refreshedDetails
+				if nextURL := hvDetails.VerifyURL(); nextURL != "" && nextURL != verifyURL {
+					verifyURL = nextURL
+					fmt.Fprintln(os.Stderr, "Proton requested a fresh verification challenge. Open this updated URL:")
+					fmt.Fprintf(os.Stderr, "  %s\n", verifyURL)
+				}
+			}
+			fmt.Fprintln(os.Stderr, "Verification challenge still active. Please solve it again and paste the new token.")
+			continue
+		}
+
+		return nil, err
+	}
+
+	return nil, fmt.Errorf("human verification failed after 3 attempts")
 }
 
 func listenAndServeSMTP(addr string, debug bool, authManager *auth.Manager, tlsConfig *tls.Config) error {
@@ -175,6 +266,9 @@ func isMbox(br *bufio.Reader) (bool, error) {
 const usage = `usage: hydroxide [options...] <command>
 Commands:
 	auth <username>		Login to ProtonMail via hydroxide
+	auth-export <username> [file]	Export cached auth state
+	auth-import <username> [file]	Import cached auth state
+	auth-verify <username>	Verify cached auth state
 	carddav			Run hydroxide as a CardDAV server
 	export-secret-keys <username> Export secret keys
 	imap			Run hydroxide as an IMAP server
@@ -243,6 +337,13 @@ func main() {
 	tlsClientCA := flag.String("tls-client-ca", "", "If set, clients must provide a certificate signed by the given CA")
 
 	authCmd := flag.NewFlagSet("auth", flag.ExitOnError)
+	authExportCmd := flag.NewFlagSet("auth-export", flag.ExitOnError)
+	authExportIncludePasswords := authExportCmd.Bool("include-passwords", false, "Include cached Proton passwords in exported auth JSON")
+	authImportCmd := flag.NewFlagSet("auth-import", flag.ExitOnError)
+	authImportKeepPasswordReauth := authImportCmd.Bool("allow-password-reauth", false, "Keep automatic password re-auth enabled for imported auth state")
+	authImportBridgePassword := authImportCmd.String("bridge-password", "", "Bridge password to use for the imported auth state (generated automatically when omitted)")
+	authImportSkipVerify := authImportCmd.Bool("skip-verify", false, "Skip live refresh/unlock verification before saving imported auth state")
+	authVerifyCmd := flag.NewFlagSet("auth-verify", flag.ExitOnError)
 	exportSecretKeysCmd := flag.NewFlagSet("export-secret-keys", flag.ExitOnError)
 	importMessagesCmd := flag.NewFlagSet("import-messages", flag.ExitOnError)
 	exportMessagesCmd := flag.NewFlagSet("export-messages", flag.ExitOnError)
@@ -295,7 +396,12 @@ func main() {
 
 			a, err = c.Auth(username, loginPassword, authInfo)
 			if err != nil {
-				log.Fatal(err)
+				if apiErr, ok := err.(*protonmail.APIError); ok && apiErr.IsHVError() {
+					a, err = completeHumanVerification(c, username, loginPassword, apiErr)
+				}
+				if err != nil {
+					log.Fatal(err)
+				}
 			}
 
 			if a.TwoFactor.Enabled != 0 {
@@ -348,16 +454,133 @@ func main() {
 		}
 
 		err = auth.EncryptAndSave(&auth.CachedAuth{
-			Auth:            *a,
-			LoginPassword:   loginPassword,
-			MailboxPassword: mailboxPassword,
-			KeySalts:        keySalts,
+			Auth:                  *a,
+			LoginPassword:         loginPassword,
+			MailboxPassword:       mailboxPassword,
+			KeySalts:              keySalts,
+			DisablePasswordReauth: false,
 		}, username, secretKey)
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		fmt.Println("Bridge password:", bridgePassword)
+	case "auth-export":
+		authExportCmd.Parse(flag.Args()[1:])
+		username := authExportCmd.Arg(0)
+		exportPath := authExportCmd.Arg(1)
+		if username == "" {
+			log.Fatal("usage: hydroxide auth-export <username> [file]")
+		}
+
+		bridgePassword, err := askBridgePass()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		exported, err := auth.ExportCachedAuth(username, bridgePassword, *authExportIncludePasswords)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		data, err := json.MarshalIndent(exported, "", "  ")
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if exportPath == "" {
+			os.Stdout.Write(data)
+			os.Stdout.Write([]byte("\n"))
+		} else if err := os.WriteFile(exportPath, append(data, '\n'), 0600); err != nil {
+			log.Fatal(err)
+		}
+	case "auth-import":
+		authImportCmd.Parse(flag.Args()[1:])
+		username := authImportCmd.Arg(0)
+		importPath := authImportCmd.Arg(1)
+		if username == "" {
+			log.Fatal("usage: hydroxide auth-import <username> [file]")
+		}
+
+		var r io.Reader = os.Stdin
+		if importPath != "" {
+			f, err := os.Open(importPath)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer f.Close()
+			r = f
+		}
+
+		var imported auth.CachedAuth
+		if err := json.NewDecoder(r).Decode(&imported); err != nil {
+			log.Fatal(err)
+		}
+
+		imported.DisablePasswordReauth = !*authImportKeepPasswordReauth
+		if imported.DisablePasswordReauth {
+			imported.LoginPassword = ""
+		}
+
+		if !*authImportSkipVerify {
+			c := newClient()
+			refreshed, err := c.AuthRefresh(&imported.Auth)
+			if err != nil {
+				log.Fatalf("imported auth failed refresh verification: %v", err)
+			}
+			imported.Auth = *refreshed
+			if _, err := c.Unlock(&imported.Auth, imported.KeySalts, imported.MailboxPassword); err != nil {
+				log.Fatalf("imported auth failed mailbox unlock verification: %v", err)
+			}
+		}
+
+		var (
+			secretKey      *[32]byte
+			bridgePassword string
+		)
+		if *authImportBridgePassword != "" {
+			bridgePassword = *authImportBridgePassword
+			secretKey, err = auth.DecodeBridgePassword(bridgePassword)
+			if err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			secretKey, bridgePassword, err = auth.GeneratePassword()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		if err := auth.ImportCachedAuth(username, &imported, secretKey); err != nil {
+			log.Fatal(err)
+		}
+
+		fmt.Println("Bridge password:", bridgePassword)
+		if imported.DisablePasswordReauth {
+			fmt.Println("Mode: refresh-only (automatic password re-auth disabled)")
+		} else {
+			fmt.Println("Mode: password re-auth allowed")
+		}
+	case "auth-verify":
+		authVerifyCmd.Parse(flag.Args()[1:])
+		username := authVerifyCmd.Arg(0)
+		if username == "" {
+			log.Fatal("usage: hydroxide auth-verify <username>")
+		}
+
+		bridgePassword, err := askBridgePass()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		cachedAuth, err := auth.Verify(newClient, username, bridgePassword)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		fmt.Println("Auth state verified successfully")
+		fmt.Println("Refresh token present:", cachedAuth.RefreshToken != "")
+		fmt.Println("Automatic password re-auth disabled:", cachedAuth.DisablePasswordReauth)
 	case "status":
 		usernames, err := auth.ListUsernames()
 		if err != nil {

@@ -48,12 +48,53 @@ retrieve e-mails from ProtonMail. You can do so with this command:
 hydroxide auth <username>
 ```
 
+If Proton asks for human verification (error code `9001`), the local auth flow
+now switches into a manual browser-assisted mode:
+
+1. Hydroxide prints a `https://verify.proton.me/...` URL.
+2. Open your browser developer tools and paste the listener snippet that
+   Hydroxide prints.
+3. Solve the challenge in your browser.
+4. Paste the solved token back into the CLI prompt.
+
+This keeps the login flow headless-friendly while still letting you complete
+Proton's verification challenge in your own browser session.
+
 Once you're logged in, a "bridge password" will be printed. Don't close your
 terminal yet, as this password is not stored anywhere by hydroxide and will be
 needed when configuring your e-mail client.
 
 Your ProtonMail credentials are stored on disk encrypted with this bridge
 password (a 32-byte random password generated when logging in).
+
+### Moving a valid auth session between machines
+
+If you can authenticate on one machine but want the server to avoid automatic
+full password re-authentication later, you can move the cached auth state:
+
+```shell
+hydroxide auth-export <username> exported-auth.json
+hydroxide auth-import <username> exported-auth.json
+```
+
+By default, `auth-export` strips the cached login password but keeps the
+mailbox password required to unlock Proton keys. The imported state is saved in
+`refresh-only` mode, which means Hydroxide will continue to use refresh tokens
+but will not automatically attempt a fresh password login when the refresh
+token becomes invalid.
+
+If you explicitly want an imported state to retain automatic password re-auth,
+use:
+
+```shell
+hydroxide auth-import -allow-password-reauth <username> exported-auth.json
+```
+
+To verify a cached auth state without starting IMAP/SMTP:
+
+```shell
+hydroxide auth-verify <username>
+```
 
 ## Usage
 

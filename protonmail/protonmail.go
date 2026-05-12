@@ -30,6 +30,7 @@ func (r *resp) Err() error {
 		return &APIError{
 			Code:    r.Code,
 			Message: err.Message,
+			Details: err.Details,
 		}
 	}
 	return nil
@@ -40,12 +41,14 @@ type maybeError interface {
 }
 
 type RawAPIError struct {
-	Message string `json:"Error"`
+	Message string          `json:"Error"`
+	Details json.RawMessage `json:"Details,omitempty"`
 }
 
 type APIError struct {
 	Code    int
 	Message string
+	Details json.RawMessage
 }
 
 func (err *APIError) Error() string {
