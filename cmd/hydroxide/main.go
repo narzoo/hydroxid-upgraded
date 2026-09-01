@@ -60,6 +60,7 @@ func newClient() *protonmail.Client {
 const (
 	bridgeRecoveryFailureThreshold = 6
 	bridgeRecoveryMinimumAge       = 3 * time.Minute
+	imapOperationStallTimeout      = 75 * time.Second
 )
 
 type bridgeHealthMonitor struct {
@@ -67,6 +68,8 @@ type bridgeHealthMonitor struct {
 	consecutiveFails int
 	firstFailureAt   time.Time
 	lastSuccessAt    time.Time
+	activeIMAPOps    int
+	oldestIMAPOpAt   time.Time
 }
 
 func isRecoverableBridgeError(req *http.Request, err error) bool {
@@ -104,16 +107,42 @@ func (m *bridgeHealthMonitor) observe(req *http.Request, err error) {
 	m.consecutiveFails++
 }
 
-func (m *bridgeHealthMonitor) shouldRestart(now time.Time) (int, time.Duration, bool) {
+func (m *bridgeHealthMonitor) BeginIMAPOperation() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.activeIMAPOps == 0 {
+		m.oldestIMAPOpAt = time.Now()
+	}
+	m.activeIMAPOps++
+}
+
+func (m *bridgeHealthMonitor) EndIMAPOperation() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activeIMAPOps > 0 {
+		m.activeIMAPOps--
+	}
+	if m.activeIMAPOps == 0 {
+		m.oldestIMAPOpAt = time.Time{}
+	}
+}
+
+func (m *bridgeHealthMonitor) shouldRestart(now time.Time) (string, int, time.Duration, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activeIMAPOps > 0 && !m.oldestIMAPOpAt.IsZero() {
+		age := now.Sub(m.oldestIMAPOpAt)
+		if age >= imapOperationStallTimeout {
+			return "stalled IMAP operation", m.activeIMAPOps, age, true
+		}
+	}
 
 	if m.consecutiveFails < bridgeRecoveryFailureThreshold || m.firstFailureAt.IsZero() || m.lastSuccessAt.After(m.firstFailureAt) {
-		return 0, 0, false
+		return "", 0, 0, false
 	}
 
 	age := now.Sub(m.firstFailureAt)
-	return m.consecutiveFails, age, age >= bridgeRecoveryMinimumAge
+	return "repeated Proton event API failures", m.consecutiveFails, age, age >= bridgeRecoveryMinimumAge
 }
 
 func runBridgeRecoveryWatchdog() {
@@ -121,12 +150,12 @@ func runBridgeRecoveryWatchdog() {
 	defer ticker.Stop()
 
 	for now := range ticker.C {
-		failures, age, restart := bridgeHealth.shouldRestart(now)
+		reason, failures, age, restart := bridgeHealth.shouldRestart(now)
 		if !restart {
 			continue
 		}
 
-		log.Printf("BRIDGE_SELF_RECOVERY: restarting Hydroxide after %d consecutive recoverable API failures over %s", failures, age.Round(time.Second))
+		log.Printf("BRIDGE_SELF_RECOVERY: restarting Hydroxide after %s (count=%d, age=%s)", reason, failures, age.Round(time.Second))
 		os.Exit(75)
 	}
 }
@@ -267,8 +296,8 @@ func listenAndServeSMTP(addr string, debug bool, authManager *auth.Manager, tlsC
 	return s.ListenAndServe()
 }
 
-func listenAndServeIMAP(addr string, debug bool, authManager *auth.Manager, eventsManager *events.Manager, tlsConfig *tls.Config) error {
-	be := imapbackend.New(authManager, eventsManager)
+func listenAndServeIMAP(addr string, debug bool, authManager *auth.Manager, eventsManager *events.Manager, activity imapbackend.ActivityReporter, tlsConfig *tls.Config) error {
+	be := imapbackend.New(authManager, eventsManager, activity)
 	s := imapserver.New(be)
 	s.Addr = addr
 	s.AllowInsecureAuth = tlsConfig == nil
@@ -800,7 +829,7 @@ func main() {
 		addr := *imapHost + ":" + *imapPort
 		authManager := auth.NewManager(newClient)
 		eventsManager := events.NewManager()
-		log.Fatal(listenAndServeIMAP(addr, debug, authManager, eventsManager, tlsConfig))
+		log.Fatal(listenAndServeIMAP(addr, debug, authManager, eventsManager, bridgeHealth, tlsConfig))
 	case "carddav":
 		addr := *carddavHost + ":" + *carddavPort
 		authManager := auth.NewManager(newClient)
@@ -823,7 +852,7 @@ func main() {
 		}
 		if !*disableIMAP {
 			go func() {
-				done <- listenAndServeIMAP(imapAddr, debug, authManager, eventsManager, tlsConfig)
+				done <- listenAndServeIMAP(imapAddr, debug, authManager, eventsManager, bridgeHealth, tlsConfig)
 			}()
 		}
 		if !*disableCardDAV {
