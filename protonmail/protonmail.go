@@ -69,7 +69,7 @@ type Client struct {
 
 	HTTPClient     *http.Client
 	ReAuth         func() error
-	ResultObserver func(error)
+	ResultObserver func(*http.Request, error)
 
 	uid         string
 	accessToken string
@@ -161,7 +161,7 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 func (c *Client) doJSON(req *http.Request, respData interface{}) (err error) {
 	defer func() {
 		if c.ResultObserver != nil {
-			c.ResultObserver(err)
+			c.ResultObserver(req, err)
 		}
 	}()
 

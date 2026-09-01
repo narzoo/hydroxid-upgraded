@@ -69,7 +69,7 @@ type bridgeHealthMonitor struct {
 	lastSuccessAt    time.Time
 }
 
-func isRecoverableBridgeError(err error) bool {
+func isRecoverableBridgeError(req *http.Request, err error) bool {
 	if err == nil {
 		return false
 	}
@@ -80,10 +80,10 @@ func isRecoverableBridgeError(err error) bool {
 	}
 
 	apiErr, ok := err.(*protonmail.APIError)
-	return ok && apiErr.Code >= 500 && apiErr.Code < 600
+	return ok && apiErr.Code >= 500 && apiErr.Code < 600 && req != nil && strings.HasPrefix(req.URL.Path, "/api/events/")
 }
 
-func (m *bridgeHealthMonitor) observe(err error) {
+func (m *bridgeHealthMonitor) observe(req *http.Request, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -94,7 +94,7 @@ func (m *bridgeHealthMonitor) observe(err error) {
 		return
 	}
 
-	if !isRecoverableBridgeError(err) {
+	if !isRecoverableBridgeError(req, err) {
 		return
 	}
 
