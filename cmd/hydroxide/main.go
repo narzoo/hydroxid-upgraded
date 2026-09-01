@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -34,12 +36,14 @@ import (
 const (
 	defaultAPIEndpoint = "https://mail.proton.me/api"
 	defaultAppVersion  = "Other"
+	defaultHTTPTimeout = 35 * time.Second
 )
 
 var (
-	debug       bool
-	apiEndpoint string
-	appVersion  string
+	debug        bool
+	apiEndpoint  string
+	appVersion   string
+	bridgeHealth = &bridgeHealthMonitor{}
 )
 
 func newClient() *protonmail.Client {
@@ -47,6 +51,83 @@ func newClient() *protonmail.Client {
 		RootURL:    apiEndpoint,
 		AppVersion: appVersion,
 		Debug:      debug,
+		// Bound every Proton API request so a dead Tor circuit cannot pin an IMAP session forever.
+		HTTPClient:     &http.Client{Timeout: defaultHTTPTimeout},
+		ResultObserver: bridgeHealth.observe,
+	}
+}
+
+const (
+	bridgeRecoveryFailureThreshold = 6
+	bridgeRecoveryMinimumAge       = 3 * time.Minute
+)
+
+type bridgeHealthMonitor struct {
+	mu               sync.Mutex
+	consecutiveFails int
+	firstFailureAt   time.Time
+	lastSuccessAt    time.Time
+}
+
+func isRecoverableBridgeError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "timeout") || strings.Contains(message, "deadline exceeded") || strings.Contains(message, "unexpected eof") || strings.Contains(message, "invalid character '<'") {
+		return true
+	}
+
+	apiErr, ok := err.(*protonmail.APIError)
+	return ok && apiErr.Code >= 500 && apiErr.Code < 600
+}
+
+func (m *bridgeHealthMonitor) observe(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err == nil {
+		m.consecutiveFails = 0
+		m.firstFailureAt = time.Time{}
+		m.lastSuccessAt = time.Now()
+		return
+	}
+
+	if !isRecoverableBridgeError(err) {
+		return
+	}
+
+	if m.firstFailureAt.IsZero() {
+		m.firstFailureAt = time.Now()
+	}
+	m.consecutiveFails++
+}
+
+func (m *bridgeHealthMonitor) shouldRestart(now time.Time) (int, time.Duration, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.consecutiveFails < bridgeRecoveryFailureThreshold || m.firstFailureAt.IsZero() || m.lastSuccessAt.After(m.firstFailureAt) {
+		return 0, 0, false
+	}
+
+	age := now.Sub(m.firstFailureAt)
+	return m.consecutiveFails, age, age >= bridgeRecoveryMinimumAge
+}
+
+func runBridgeRecoveryWatchdog() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for now := range ticker.C {
+		failures, age, restart := bridgeHealth.shouldRestart(now)
+		if !restart {
+			continue
+		}
+
+		log.Printf("BRIDGE_SELF_RECOVERY: restarting Hydroxide after %d consecutive recoverable API failures over %s", failures, age.Round(time.Second))
+		os.Exit(75)
 	}
 }
 
@@ -732,6 +813,7 @@ func main() {
 
 		authManager := auth.NewManager(newClient)
 		eventsManager := events.NewManager()
+		go runBridgeRecoveryWatchdog()
 
 		done := make(chan error, 3)
 		if !*disableSMTP {

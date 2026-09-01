@@ -67,8 +67,9 @@ type Client struct {
 	AppVersion string
 	Debug      bool
 
-	HTTPClient *http.Client
-	ReAuth     func() error
+	HTTPClient     *http.Client
+	ReAuth         func() error
+	ResultObserver func(error)
 
 	uid         string
 	accessToken string
@@ -157,7 +158,13 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-func (c *Client) doJSON(req *http.Request, respData interface{}) error {
+func (c *Client) doJSON(req *http.Request, respData interface{}) (err error) {
+	defer func() {
+		if c.ResultObserver != nil {
+			c.ResultObserver(err)
+		}
+	}()
+
 	req.Header.Set("Accept", "application/json")
 
 	if respData == nil {

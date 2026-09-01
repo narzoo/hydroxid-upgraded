@@ -8,7 +8,10 @@ import (
 	"github.com/emersion/hydroxide/protonmail"
 )
 
-const pollInterval = 30 * time.Second
+const (
+	pollInterval              = 30 * time.Second
+	maxConsecutiveEventErrors = 3
+)
 
 type Receiver struct {
 	c *protonmail.Client
@@ -24,16 +27,26 @@ func (r *Receiver) receiveEvents() {
 	defer t.Stop()
 
 	var last string
+	consecutiveErrors := 0
 	for {
 		event, err := r.c.GetEvent(last)
 		if err != nil {
+			consecutiveErrors++
 			log.Println("cannot receive event:", err)
+			if consecutiveErrors >= maxConsecutiveEventErrors {
+				// A stale cursor can keep returning a proxy error forever. Starting from
+				// "latest" restores the event stream; IMAP still performs its own mailbox sync.
+				log.Printf("resetting event cursor after %d consecutive event errors", consecutiveErrors)
+				last = ""
+				consecutiveErrors = 0
+			}
 			select {
 			case <-t.C:
 			case <-r.poll:
 			}
 			continue
 		}
+		consecutiveErrors = 0
 		last = event.ID
 
 		r.locker.Lock()
